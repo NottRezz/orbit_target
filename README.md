@@ -113,6 +113,18 @@ local info = exports['orbit_target']:GetEntityInfo(entity)
 --   coords   = vector3(...),
 --   heading  = 180.0,
 -- }
+
+-- Raycasts from the gameplay camera and returns where the player is looking.
+-- maxDistance defaults to Config.LockOnRadius, flags default to 511,
+-- ignoreEntity defaults to PlayerPedId().
+local look = exports['orbit_target']:GetLookCoords(100.0)
+-- look = {
+--   hit       = true,
+--   coords    = vector3(...), -- hit coords, or ray end coords if nothing was hit
+--   entity    = 12345,        -- entity hit, or 0
+--   normal    = vector3(...),
+--   endCoords = vector3(...),
+-- }
 ```
 
 ### Lock-On Mode

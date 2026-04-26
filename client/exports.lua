@@ -48,6 +48,10 @@ exports('GetEntityInfo', function(entity)
     return OrbitTarget.getEntityInfo(entity)
 end)
 
+exports('GetLookCoords', function(maxDistance, flags, ignoreEntity)
+    return OrbitTarget.getLookCoords(maxDistance, flags, ignoreEntity)
+end)
+
 -- Lock-on
 exports('ForceLock', function(entity)
     return OrbitTarget.forceLock(entity)

@@ -17,6 +17,9 @@
 local math_sqrt  = math.sqrt
 local math_floor = math.floor
 local math_max   = math.max
+local math_rad   = math.rad
+local math_sin   = math.sin
+local math_cos   = math.cos
 local ipairs     = ipairs
 local table_remove = table.remove
 
@@ -32,6 +35,8 @@ local DoesEntityExist = DoesEntityExist
 local IsEntityAPed = IsEntityAPed
 local IsEntityAVehicle = IsEntityAVehicle
 local IsEntityDead = IsEntityDead
+local IsPedInAnyVehicle = IsPedInAnyVehicle
+local GetVehiclePedIsIn = GetVehiclePedIsIn
 local IsPedInCombat = IsPedInCombat
 local IsPedArmed = IsPedArmed
 local GetPedRelationshipGroupHash = GetPedRelationshipGroupHash
@@ -55,6 +60,10 @@ local NetToEnt = NetToEnt
 local RegisterNetEvent = RegisterNetEvent
 local AddEventHandler = AddEventHandler
 local GetCurrentResourceName = GetCurrentResourceName
+local GetGameplayCamCoord = GetGameplayCamCoord
+local GetGameplayCamRot = GetGameplayCamRot
+local StartShapeTestRay = StartShapeTestRay
+local GetShapeTestResult = GetShapeTestResult
 
 -- ─── State ────────────────────────────────────────────────────────────────────
 
@@ -68,7 +77,7 @@ local state = {
     softTargetType = nil,   -- 'ped' | 'vehicle' | 'object'
 
     -- lock-on mode
-    lockSlots      = {},    -- array of { entity, type, acquireTime, losTimer }
+    lockSlots      = {},    -- array of { entity, type, acquireTime }
     primarySlot    = 1,
 
     -- NUI dirty-flag throttle
@@ -101,8 +110,6 @@ local lockOnRequiresKey = Config.LockOnRequiresKey
 local lockOnKey = Config.LockOnKey
 local lockOnCycleKey = Config.LockOnCycleKey
 local cancelLockOnKey = Config.CancelLockOnKey
-local lockOnBreakLOS = Config.LockOnBreakLOS
-local lockOnBreakLOSTime = Config.LockOnBreakLOSTime
 
 local function refreshPoolCache()
     local now = GetGameTimer()
@@ -136,6 +143,26 @@ end
 
 local function isEntityValid(ent)
     return ent and ent ~= 0 and DoesEntityExist(ent) and not IsEntityDead(ent)
+end
+
+local function pedLockTarget(ent)
+    if IsPedInAnyVehicle(ent, false) then
+        local veh = GetVehiclePedIsIn(ent, false)
+        if veh and veh ~= 0 and DoesEntityExist(veh) then
+            return veh, 'vehicle'
+        end
+        return nil, nil
+    end
+
+    return ent, 'ped'
+end
+
+local function resolveTargetCandidate(ent, eType)
+    if eType == 'ped' then
+        return pedLockTarget(ent)
+    end
+
+    return ent, eType
 end
 
 local function getEntityLabel(ent, eType)
@@ -184,6 +211,18 @@ local function fireCallbacks(list, ...)
     for _, fn in ipairs(list) do
         pcall(fn, ...)
     end
+end
+
+local function rotationToDirection(rot)
+    local z = math_rad(rot.z)
+    local x = math_rad(rot.x)
+    local cosX = math_cos(x)
+
+    return vector3(
+        -math_sin(z) * cosX,
+        math_cos(z) * cosX,
+        math_sin(x)
+    )
 end
 
 -- ─── NUI Communication ────────────────────────────────────────────────────────
@@ -295,6 +334,10 @@ end
 local function checkNormalEntity(ent, eType, playerPed, playerX, playerY, playerZ, bestSq)
     if ent == playerPed                        then return nil, bestSq end
     if not DoesEntityExist(ent)                then return nil, bestSq end
+    if ignoreDead and IsEntityDead(ent) then return nil, bestSq end
+    ent, eType = resolveTargetCandidate(ent, eType)
+    if not ent or ent == playerPed then return nil, bestSq end
+    if not DoesEntityExist(ent) then return nil, bestSq end
     if ignoreDead and IsEntityDead(ent) then return nil, bestSq end
 
     local pos = GetEntityCoords(ent)
@@ -422,7 +465,6 @@ local function addLockSlot(ent, eType)
         entity      = ent,
         type        = eType,
         acquireTime = GetGameTimer(),
-        losTimer    = 0,
     }
 
     local slot = #state.lockSlots
@@ -464,7 +506,6 @@ end
 local function updateLockOn()
     local playerPed = PlayerPedId()
     local playerPos = GetEntityCoords(playerPed)
-    local now       = GetGameTimer()
 
     for i = #state.lockSlots, 1, -1 do
         local slot = state.lockSlots[i]
@@ -474,25 +515,19 @@ local function updateLockOn()
             goto continue
         end
 
+        if slot.type == 'ped' and IsPedInAnyVehicle(slot.entity, false) then
+            local veh = GetVehiclePedIsIn(slot.entity, false)
+            if veh and veh ~= 0 and DoesEntityExist(veh) then
+                slot.entity = veh
+                slot.type = 'vehicle'
+            end
+        end
+
         local ePos = GetEntityCoords(slot.entity)
         local dx, dy, dz = ePos.x - playerPos.x, ePos.y - playerPos.y, ePos.z - playerPos.z
         if (dx*dx + dy*dy + dz*dz) > lockBreakSq then
             removeLockSlot(i, 'distance')
             goto continue
-        end
-
-        if lockOnBreakLOS then
-            local hasLOS = HasEntityClearLosToEntity(playerPed, slot.entity, 17)
-            if not hasLOS then
-                if slot.losTimer == 0 then
-                    state.lockSlots[i].losTimer = now
-                elseif (now - slot.losTimer) >= lockOnBreakLOSTime then
-                    removeLockSlot(i, 'los')
-                    goto continue
-                end
-            else
-                state.lockSlots[i].losTimer = 0
-            end
         end
 
         ::continue::
@@ -514,6 +549,10 @@ local function checkLockEntity(ent, eType, playerPed, playerX, playerY, playerZ,
     if ent == playerPed         then return nil, bestSq end
     if not DoesEntityExist(ent) then return nil, bestSq end
     if IsEntityDead(ent)        then return nil, bestSq end
+    ent, eType = resolveTargetCandidate(ent, eType)
+    if not ent or ent == playerPed then return nil, bestSq end
+    if not DoesEntityExist(ent) then return nil, bestSq end
+    if IsEntityDead(ent) then return nil, bestSq end
 
     local pos = GetEntityCoords(ent)
     local dx, dy, dz = pos.x - playerX, pos.y - playerY, pos.z - playerZ
@@ -746,6 +785,12 @@ end
 function OrbitTarget.forceLock(entity)
     if not DoesEntityExist(entity) then return false end
     local eType = entityType(entity)
+    if eType == 'ped' then
+        local lockEntity, lockType = pedLockTarget(entity)
+        if not lockEntity then return false end
+        entity, eType = lockEntity, lockType
+    end
+
     if state.mode ~= 'lockon' then
         state.mode = 'lockon'
         fireCallbacks(callbacks.onModeChange, 'lockon', 'normal')
@@ -807,6 +852,31 @@ function OrbitTarget.getEntityInfo(entity)
 end
 
 -- ─── Callback Registration ────────────────────────────────────────────────────
+
+function OrbitTarget.getLookCoords(maxDistance, flags, ignoreEntity)
+    local camCoords = GetGameplayCamCoord()
+    local direction = rotationToDirection(GetGameplayCamRot(2))
+    local distance = maxDistance or Config.LockOnRadius
+    local endCoords = vector3(
+        camCoords.x + (direction.x * distance),
+        camCoords.y + (direction.y * distance),
+        camCoords.z + (direction.z * distance)
+    )
+    local ignored = ignoreEntity or PlayerPedId()
+
+    local ray = StartShapeTestRay(
+        camCoords.x, camCoords.y, camCoords.z,
+        endCoords.x, endCoords.y, endCoords.z,
+        flags or 511,
+        ignored,
+        0
+    )
+
+    local _, hit, hitCoords, surfaceNormal, entityHit = GetShapeTestResult(ray)
+    local coords = hit == 1 and hitCoords or endCoords
+
+    return endCoords, hitCoords
+end
 
 function OrbitTarget.onSoftTarget(fn)
     callbacks.onSoftTarget[#callbacks.onSoftTarget + 1] = fn
