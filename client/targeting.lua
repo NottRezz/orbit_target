@@ -64,6 +64,9 @@ local GetGameplayCamCoord = GetGameplayCamCoord
 local GetGameplayCamRot = GetGameplayCamRot
 local StartShapeTestRay = StartShapeTestRay
 local GetShapeTestResult = GetShapeTestResult
+local GetHashKey = GetHashKey
+
+local rcbanditoHash = GetHashKey('rcbandito')
 
 -- ─── State ────────────────────────────────────────────────────────────────────
 
@@ -335,6 +338,7 @@ local function checkNormalEntity(ent, eType, playerPed, playerX, playerY, player
     if ent == playerPed                        then return nil, bestSq end
     if not DoesEntityExist(ent)                then return nil, bestSq end
     if ignoreDead and IsEntityDead(ent) then return nil, bestSq end
+    if GetEntityModel(ent) == rcbanditoHash    then return nil, bestSq end
     ent, eType = resolveTargetCandidate(ent, eType)
     if not ent or ent == playerPed then return nil, bestSq end
     if not DoesEntityExist(ent) then return nil, bestSq end
@@ -546,9 +550,10 @@ end
 
 -- Attempt to acquire lock-on on the entity closest to screen centre
 local function checkLockEntity(ent, eType, playerPed, playerX, playerY, playerZ, bestSq)
-    if ent == playerPed         then return nil, bestSq end
-    if not DoesEntityExist(ent) then return nil, bestSq end
-    if IsEntityDead(ent)        then return nil, bestSq end
+    if ent == playerPed                     then return nil, bestSq end
+    if not DoesEntityExist(ent)             then return nil, bestSq end
+    if IsEntityDead(ent)                    then return nil, bestSq end
+    if GetEntityModel(ent) == rcbanditoHash then return nil, bestSq end
     ent, eType = resolveTargetCandidate(ent, eType)
     if not ent or ent == playerPed then return nil, bestSq end
     if not DoesEntityExist(ent) then return nil, bestSq end
