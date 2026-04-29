@@ -99,9 +99,16 @@ local callbacks = {
 }
 
 -- ─── Pool cache — refreshed every POOL_REFRESH_MS, avoids table-per-scan ────
-local poolCache = { peds = {}, vehicles = {}, objects = {} }
+local poolCache = {
+    peds = {},
+    vehicles = {},
+    objects = {},
+    normalCandidates = {},
+}
 local poolLastRefresh = 0
 local POOL_REFRESH_MS = 250
+local LOS_CHECK_MS = 250
+local COARSE_FORWARD_DOT = 0.25 -- broad pre-screen cull; exact snap test still decides selection
 local targetPeds = Config.TargetPeds
 local targetVehicles = Config.TargetVehicles
 local targetObjects = Config.TargetObjects
@@ -113,15 +120,11 @@ local lockOnRequiresKey = Config.LockOnRequiresKey
 local lockOnKey = Config.LockOnKey
 local lockOnCycleKey = Config.LockOnCycleKey
 local cancelLockOnKey = Config.CancelLockOnKey
-
-local function refreshPoolCache()
-    local now = GetGameTimer()
-    if (now - poolLastRefresh) < POOL_REFRESH_MS then return end
-    poolLastRefresh = now
-    if targetPeds     then poolCache.peds     = GetGamePool('CPed')     end
-    if targetVehicles then poolCache.vehicles = GetGamePool('CVehicle') end
-    if targetObjects  then poolCache.objects  = GetGamePool('CObject')  end
-end
+local showTargetHealth = Config.ShowTargetHealth
+local showTargetDistance = Config.ShowTargetDistance
+local showTargetThreat = Config.ShowTargetThreat
+local lockOnBreakLOS = Config.LockOnBreakLOS
+local lockOnBreakLOSTime = Config.LockOnBreakLOSTime
 
 -- Pre-squared thresholds — avoids sqrt in hot-path radius checks
 local scanRadSq  = Config.ScanRadius   * Config.ScanRadius
@@ -131,6 +134,8 @@ local lockBreakSq = Config.LockOnBreakDistance * Config.LockOnBreakDistance
 local snapSq     = Config.ScreenSnapRadius  * Config.ScreenSnapRadius
 local lockSnapSq = Config.LockOnScreenSnap  * Config.LockOnScreenSnap
 local staticNUIActions = { hide = true, idle = true }
+local HIDE_PAYLOAD = { action = 'hide' }
+local IDLE_PAYLOAD = { action = 'idle' }
 
 -- ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -228,16 +233,111 @@ local function rotationToDirection(rot)
     )
 end
 
+local function coarseForwardCull(dx, dy, dz, dir)
+    local distSq = dx*dx + dy*dy + dz*dz
+    if distSq <= 0.0001 then return true end
+
+    local dot = dx*dir.x + dy*dir.y + dz*dir.z
+    if dot <= 0.0 then return false end
+
+    return (dot*dot) >= (distSq * COARSE_FORWARD_DOT * COARSE_FORWARD_DOT)
+end
+
+local function addNearbyCandidate(out, seen, ent, eType, playerPed, playerX, playerY, playerZ, radiusSq, skipDead)
+    if ent == playerPed or not DoesEntityExist(ent) then return end
+    if skipDead and IsEntityDead(ent) then return end
+
+    local pos = GetEntityCoords(ent)
+    local dx, dy, dz = pos.x - playerX, pos.y - playerY, pos.z - playerZ
+    if (dx*dx + dy*dy + dz*dz) > radiusSq then return end
+
+    if eType == 'ped' then
+        ent, eType = resolveTargetCandidate(ent, eType)
+        if not ent or ent == playerPed or not DoesEntityExist(ent) then return end
+        if skipDead and IsEntityDead(ent) then return end
+    end
+
+    if seen[ent] then return end
+    if GetEntityModel(ent) == rcbanditoHash then return end
+
+    seen[ent] = true
+    out[#out + 1] = { entity = ent, type = eType }
+end
+
+local function buildNearbyCandidates(radiusSq, includeObjects, skipDead)
+    local playerPed = PlayerPedId()
+    local playerPos = GetEntityCoords(playerPed)
+    local playerX, playerY, playerZ = playerPos.x, playerPos.y, playerPos.z
+    local out, seen = {}, {}
+
+    if targetPeds then
+        local peds = GetGamePool('CPed')
+        for i = 1, #peds do
+            addNearbyCandidate(out, seen, peds[i], 'ped', playerPed, playerX, playerY, playerZ, radiusSq, skipDead)
+        end
+    end
+
+    if targetVehicles then
+        local vehicles = GetGamePool('CVehicle')
+        for i = 1, #vehicles do
+            addNearbyCandidate(out, seen, vehicles[i], 'vehicle', playerPed, playerX, playerY, playerZ, radiusSq, skipDead)
+        end
+    end
+
+    if includeObjects and targetObjects then
+        local objects = GetGamePool('CObject')
+        for i = 1, #objects do
+            addNearbyCandidate(out, seen, objects[i], 'object', playerPed, playerX, playerY, playerZ, radiusSq, skipDead)
+        end
+    end
+
+    return out
+end
+
+local function refreshNormalCandidates(force, playerPed, playerX, playerY, playerZ)
+    local now = GetGameTimer()
+    if not force and (now - poolLastRefresh) < POOL_REFRESH_MS then return end
+
+    poolLastRefresh = now
+    local out, seen = {}, {}
+
+    if targetPeds then
+        poolCache.peds = GetGamePool('CPed')
+        local peds = poolCache.peds
+        for i = 1, #peds do
+            addNearbyCandidate(out, seen, peds[i], 'ped', playerPed, playerX, playerY, playerZ, scanRadSq, ignoreDead)
+        end
+    end
+
+    if targetVehicles then
+        poolCache.vehicles = GetGamePool('CVehicle')
+        local vehicles = poolCache.vehicles
+        for i = 1, #vehicles do
+            addNearbyCandidate(out, seen, vehicles[i], 'vehicle', playerPed, playerX, playerY, playerZ, scanRadSq, ignoreDead)
+        end
+    end
+
+    if targetObjects then
+        poolCache.objects = GetGamePool('CObject')
+        local objects = poolCache.objects
+        for i = 1, #objects do
+            addNearbyCandidate(out, seen, objects[i], 'object', playerPed, playerX, playerY, playerZ, scanRadSq, ignoreDead)
+        end
+    end
+
+    poolCache.normalCandidates = out
+end
+
 -- ─── NUI Communication ────────────────────────────────────────────────────────
 
 local function buildNUIPayload()
     if state.mode == 'none' or not state.enabled then
-        return { action = 'hide' }
+        return HIDE_PAYLOAD
     end
 
     if state.mode == 'normal' then
         if not isEntityValid(state.softTarget) then
-            return { action = 'idle' }
+            return IDLE_PAYLOAD
         end
         local playerPed = PlayerPedId()
         local playerPos = GetEntityCoords(playerPed)
@@ -245,30 +345,33 @@ local function buildNUIPayload()
         local eType = state.softTargetType
         local pos   = GetEntityCoords(ent)
         local dx, dy, dz = pos.x - playerPos.x, pos.y - playerPos.y, pos.z - playerPos.z
-        local dist  = math_sqrt(dx*dx + dy*dy + dz*dz)
+        local distance = nil
+        if showTargetDistance then
+            distance = math_floor(math_sqrt(dx*dx + dy*dy + dz*dz))
+        end
 
         local onScreen, sx, sy = GetScreenCoordFromWorldCoord(pos.x, pos.y, pos.z + 0.5)
 
-        local health, overflow = getEntityHealthFull(ent, eType)
+        local health, overflow = nil, false
+        if showTargetHealth then
+            health, overflow = getEntityHealthFull(ent, eType)
+        end
 
         return {
             action   = 'normal',
             onScreen = onScreen,
             sx       = sx,
             sy       = sy,
-            health   = Config.ShowTargetHealth   and health           or nil,
+            health   = health,
             overflow = overflow,
-            distance = Config.ShowTargetDistance and math_floor(dist) or nil,
-            threat   = Config.ShowTargetThreat   and getEntityThreat(ent, eType, playerPed) or nil,
+            distance = distance,
+            threat   = showTargetThreat and getEntityThreat(ent, eType, playerPed) or nil,
         }
     end
 
     if state.mode == 'lockon' then
         local playerPed = PlayerPedId()
         local playerPos = GetEntityCoords(playerPed)
-        local showHealth = Config.ShowTargetHealth
-        local showDistance = Config.ShowTargetDistance
-        local showThreat = Config.ShowTargetThreat
         local slots = {}
         local lockSlots = state.lockSlots
         for i = 1, #lockSlots do
@@ -276,19 +379,25 @@ local function buildNUIPayload()
             if isEntityValid(slot.entity) then
                 local pos  = GetEntityCoords(slot.entity)
                 local dx, dy, dz = pos.x - playerPos.x, pos.y - playerPos.y, pos.z - playerPos.z
-                local dist = math_sqrt(dx*dx + dy*dy + dz*dz)
+                local distance = nil
+                if showTargetDistance then
+                    distance = math_floor(math_sqrt(dx*dx + dy*dy + dz*dz))
+                end
 
                 local onScreen, sx, sy = GetScreenCoordFromWorldCoord(pos.x, pos.y, pos.z + 0.5)
 
-                local health, overflow = getEntityHealthFull(slot.entity, slot.type)
+                local health, overflow = nil, false
+                if showTargetHealth then
+                    health, overflow = getEntityHealthFull(slot.entity, slot.type)
+                end
 
                 slots[#slots + 1] = {
                     slot     = i,
                     primary  = (i == state.primarySlot),
-                    health   = showHealth and health or nil,
+                    health   = health,
                     overflow = overflow,
-                    distance = showDistance and math_floor(dist) or nil,
-                    threat   = showThreat and getEntityThreat(slot.entity, slot.type, playerPed) or nil,
+                    distance = distance,
+                    threat   = showTargetThreat and getEntityThreat(slot.entity, slot.type, playerPed) or nil,
                     onScreen = onScreen,
                     sx       = sx,
                     sy       = sy,
@@ -297,7 +406,7 @@ local function buildNUIPayload()
         end
 
         if #slots == 0 then
-            return { action = 'hide' }
+            return HIDE_PAYLOAD
         end
 
         return {
@@ -306,7 +415,7 @@ local function buildNUIPayload()
         }
     end
 
-    return { action = 'hide' }
+    return HIDE_PAYLOAD
 end
 
 local function pushNUI(force)
@@ -322,6 +431,7 @@ local function pushNUI(force)
     if not force and state.lastNUIPayload
         and staticNUIActions[payload.action]
         and payload.action == state.lastNUIPayload.action then
+        state.nuiDirty = false
         return
     end
 
@@ -334,18 +444,14 @@ end
 
 -- ─── Normal Mode ──────────────────────────────────────────────────────────────
 
-local function checkNormalEntity(ent, eType, playerPed, playerX, playerY, playerZ, bestSq)
-    if ent == playerPed                        then return nil, bestSq end
-    if not DoesEntityExist(ent)                then return nil, bestSq end
-    if ignoreDead and IsEntityDead(ent) then return nil, bestSq end
-    if GetEntityModel(ent) == rcbanditoHash    then return nil, bestSq end
-    ent, eType = resolveTargetCandidate(ent, eType)
-    if not ent or ent == playerPed then return nil, bestSq end
-    if not DoesEntityExist(ent) then return nil, bestSq end
+local function checkNormalCandidate(candidate, playerPed, playerX, playerY, playerZ, camDir, bestSq)
+    local ent = candidate.entity
+    if ent == playerPed or not DoesEntityExist(ent) then return nil, bestSq end
     if ignoreDead and IsEntityDead(ent) then return nil, bestSq end
 
     local pos = GetEntityCoords(ent)
     local dx, dy, dz = pos.x - playerX, pos.y - playerY, pos.z - playerZ
+    if not coarseForwardCull(dx, dy, dz, camDir) then return nil, bestSq end
     if (dx*dx + dy*dy + dz*dz) > scanRadSq then return nil, bestSq end
 
     local onScreen, sx, sy = GetScreenCoordFromWorldCoord(pos.x, pos.y, pos.z + 0.5)
@@ -357,13 +463,14 @@ local function checkNormalEntity(ent, eType, playerPed, playerX, playerY, player
 
     if not HasEntityClearLosToEntity(playerPed, ent, 17) then return nil, bestSq end
 
-    return ent, sq, eType
+    return ent, sq, candidate.type
 end
 
 local function scanNormal()
     local playerPed = PlayerPedId()
     local playerPos = GetEntityCoords(playerPed)
     local playerX, playerY, playerZ = playerPos.x, playerPos.y, playerPos.z
+    local camDir = rotationToDirection(GetGameplayCamRot(2))
 
     local bestEnt  = nil
     local bestSq   = snapSq   -- screen-distance² threshold; updated as we find closer candidates
@@ -404,35 +511,13 @@ local function scanNormal()
 
     --]]
 
-    refreshPoolCache()
+    refreshNormalCandidates(false, playerPed, playerX, playerY, playerZ)
 
-    if targetPeds then
-        local peds = poolCache.peds
-        for i = 1, #peds do
-            local ent, sq, eType = checkNormalEntity(peds[i], 'ped', playerPed, playerX, playerY, playerZ, bestSq)
-            if ent then
-                bestEnt, bestSq, bestType = ent, sq, eType
-            end
-        end
-    end
-
-    if targetVehicles then
-        local vehicles = poolCache.vehicles
-        for i = 1, #vehicles do
-            local ent, sq, eType = checkNormalEntity(vehicles[i], 'vehicle', playerPed, playerX, playerY, playerZ, bestSq)
-            if ent then
-                bestEnt, bestSq, bestType = ent, sq, eType
-            end
-        end
-    end
-
-    if targetObjects then
-        local objects = poolCache.objects
-        for i = 1, #objects do
-            local ent, sq, eType = checkNormalEntity(objects[i], 'object', playerPed, playerX, playerY, playerZ, bestSq)
-            if ent then
-                bestEnt, bestSq, bestType = ent, sq, eType
-            end
+    local candidates = poolCache.normalCandidates
+    for i = 1, #candidates do
+        local ent, sq, eType = checkNormalCandidate(candidates[i], playerPed, playerX, playerY, playerZ, camDir, bestSq)
+        if ent then
+            bestEnt, bestSq, bestType = ent, sq, eType
         end
     end
 
@@ -449,6 +534,7 @@ local function scanNormal()
     else
         pushNUI(false)
     end
+
 end
 
 -- ─── Lock-On Mode ─────────────────────────────────────────────────────────────
@@ -469,6 +555,8 @@ local function addLockSlot(ent, eType)
         entity      = ent,
         type        = eType,
         acquireTime = GetGameTimer(),
+        lastLosCheck = 0,
+        losLostSince = nil,
     }
 
     local slot = #state.lockSlots
@@ -508,6 +596,7 @@ local function clearAllLocks(reason)
 end
 
 local function updateLockOn()
+    local now = GetGameTimer()
     local playerPed = PlayerPedId()
     local playerPos = GetEntityCoords(playerPed)
 
@@ -534,6 +623,19 @@ local function updateLockOn()
             goto continue
         end
 
+        if lockOnBreakLOS and (now - (slot.lastLosCheck or 0)) >= LOS_CHECK_MS then
+            slot.lastLosCheck = now
+            if HasEntityClearLosToEntity(playerPed, slot.entity, 17) then
+                slot.losLostSince = nil
+            else
+                slot.losLostSince = slot.losLostSince or now
+                if (now - slot.losLostSince) >= lockOnBreakLOSTime then
+                    removeLockSlot(i, 'los')
+                    goto continue
+                end
+            end
+        end
+
         ::continue::
     end
 
@@ -549,18 +651,14 @@ local function updateLockOn()
 end
 
 -- Attempt to acquire lock-on on the entity closest to screen centre
-local function checkLockEntity(ent, eType, playerPed, playerX, playerY, playerZ, bestSq)
-    if ent == playerPed                     then return nil, bestSq end
-    if not DoesEntityExist(ent)             then return nil, bestSq end
-    if IsEntityDead(ent)                    then return nil, bestSq end
-    if GetEntityModel(ent) == rcbanditoHash then return nil, bestSq end
-    ent, eType = resolveTargetCandidate(ent, eType)
-    if not ent or ent == playerPed then return nil, bestSq end
-    if not DoesEntityExist(ent) then return nil, bestSq end
+local function checkLockCandidate(candidate, playerPed, playerX, playerY, playerZ, camDir, bestSq)
+    local ent = candidate.entity
+    if ent == playerPed or not DoesEntityExist(ent) then return nil, bestSq end
     if IsEntityDead(ent) then return nil, bestSq end
 
     local pos = GetEntityCoords(ent)
     local dx, dy, dz = pos.x - playerX, pos.y - playerY, pos.z - playerZ
+    if not coarseForwardCull(dx, dy, dz, camDir) then return nil, bestSq end
     if (dx*dx + dy*dy + dz*dz) > lockRadSq then return nil, bestSq end
 
     local onScreen, sx, sy = GetScreenCoordFromWorldCoord(pos.x, pos.y, pos.z + 0.5)
@@ -572,13 +670,14 @@ local function checkLockEntity(ent, eType, playerPed, playerX, playerY, playerZ,
 
     if not HasEntityClearLosToEntity(playerPed, ent, 17) then return nil, bestSq end
 
-    return ent, sq, eType
+    return ent, sq, candidate.type
 end
 
 local function tryAcquireLock()
     local playerPed = PlayerPedId()
     local playerPos = GetEntityCoords(playerPed)
     local playerX, playerY, playerZ = playerPos.x, playerPos.y, playerPos.z
+    local camDir = rotationToDirection(GetGameplayCamRot(2))
 
     local bestEnt  = nil
     local bestSq   = lockSnapSq
@@ -617,23 +716,11 @@ local function tryAcquireLock()
     -- tryAcquireLock is called on keypress, not per-frame — use fresh pools
     --]]
 
-    if targetPeds then
-        local peds = GetGamePool('CPed')
-        for i = 1, #peds do
-            local ent, sq, eType = checkLockEntity(peds[i], 'ped', playerPed, playerX, playerY, playerZ, bestSq)
-            if ent then
-                bestEnt, bestSq, bestType = ent, sq, eType
-            end
-        end
-    end
-
-    if targetVehicles then
-        local vehicles = GetGamePool('CVehicle')
-        for i = 1, #vehicles do
-            local ent, sq, eType = checkLockEntity(vehicles[i], 'vehicle', playerPed, playerX, playerY, playerZ, bestSq)
-            if ent then
-                bestEnt, bestSq, bestType = ent, sq, eType
-            end
+    local candidates = buildNearbyCandidates(lockRadSq, false, true)
+    for i = 1, #candidates do
+        local ent, sq, eType = checkLockCandidate(candidates[i], playerPed, playerX, playerY, playerZ, camDir, bestSq)
+        if ent then
+            bestEnt, bestSq, bestType = ent, sq, eType
         end
     end
 
@@ -739,6 +826,8 @@ function OrbitTarget.enable()
     if state.enabled then return end
     state.enabled = true
     state.mode    = 'normal'
+    poolLastRefresh = 0
+    poolCache.normalCandidates = {}
     SetNuiFocus(false, false)
     startNormalLoop()
     startLockOnLoop()
@@ -905,15 +994,6 @@ end
 
 -- ─── NUI Dirty-Flag Flusher ───────────────────────────────────────────────────
 -- Runs at 33ms (matching NUIThrottle) — no need to check every frame.
-CreateThread(function()
-    while true do
-        Wait(33)
-        if state.nuiDirty then
-            pushNUI(true)
-        end
-    end
-end)
-
 -- ─── Server-Triggered Net Events ─────────────────────────────────────────────
 
 RegisterNetEvent('orbit_target:client:forceTarget', function(netId)
